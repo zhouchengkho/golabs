@@ -6,11 +6,12 @@ import "fmt"
 
 import "crypto/rand"
 import "math/big"
-
+import "time"
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
+	srv string
 }
 
 // this may come in handy.
@@ -25,10 +26,9 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
-
+	ck.srv = ""
 	return ck
 }
-
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -74,8 +74,21 @@ func call(srv string, rpcname string,
 func (ck *Clerk) Get(key string) string {
 
 	// Your code here.
+	num := nrand()
+	args := &GetArgs{key, num}
+	reply := &GetReply{Init, ""}
 
-	return "???"
+	ok := call(ck.fetchHost(), "PBServer.Get", args, &reply)
+	for !ok || reply.Err != OK {
+		if reply.Err == ErrNoKey {
+			return ""
+		}
+		time.Sleep(viewservice.PingInterval)
+		ck.srv = ck.vs.Primary()
+		ok = call(ck.fetchHost(), "PBServer.Get", args, &reply)
+	}
+	return reply.Value
+	// return "???"
 }
 
 //
@@ -84,6 +97,26 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	// Your code here.
+
+	num := nrand()
+	args := &PutAppendArgs{key, value, op, num, "CLIENT"}
+	var reply PutAppendReply
+	reply.Err = Init
+
+	ok := call(ck.fetchHost(), "PBServer.PutAppend", args, &reply)
+	for !ok || reply.Err != OK {
+		time.Sleep(viewservice.PingInterval)
+		ck.srv = ck.vs.Primary()
+		ok = call(ck.fetchHost(), "PBServer.PutAppend", args, &reply)
+	}
+	if reply.Err == OK {
+
+	} else if reply.Err == ErrAlreadyTransmitted {
+
+	} else if reply.Err == ErrWrongServer {
+
+	}
+
 }
 
 //
@@ -100,4 +133,11 @@ func (ck *Clerk) Put(key string, value string) {
 //
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) fetchHost() string {
+	if ck.srv == "" {
+		ck.srv = ck.vs.Primary()
+	}
+	return ck.srv
 }
