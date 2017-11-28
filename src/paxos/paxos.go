@@ -31,6 +31,9 @@ import "sync/atomic"
 import "fmt"
 import "math/rand"
 
+// import "container/list"
+
+import "time"
 
 // px.Status() return values, indicating
 // whether an agreement has been decided,
@@ -42,6 +45,7 @@ const (
 	Decided   Fate = iota + 1
 	Pending        // not yet decided.
 	Forgotten      // decided but forgotten.
+	New            // haven't seen before
 )
 
 type Paxos struct {
@@ -53,8 +57,12 @@ type Paxos struct {
 	peers      []string
 	me         int // index into peers[]
 
-
 	// Your data here.
+	log  map[int]*entry
+	done map[string]int // for cleaning purpose, and getting min & max
+
+	// logs          list.List
+	// minDoneNumber int
 }
 
 //
@@ -78,7 +86,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	if err != nil {
 		err1 := err.(*net.OpError)
 		if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
-			fmt.Printf("paxos Dial() failed: %v\n", err1)
+			// fmt.Printf("paxos Dial() failed: %v\n", err1)
 		}
 		return false
 	}
@@ -88,11 +96,9 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	if err == nil {
 		return true
 	}
-
-	fmt.Println(err)
+	// fmt.Printf("possible network error \n")
 	return false
 }
-
 
 //
 // the application wants paxos to start agreement on
@@ -103,6 +109,19 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 //
 func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	if seq <= px.minDone() {
+		return // already forgotten
+	}
+
+	// if not exist, insert this entry
+	px.insertEntryIfNotExist(seq)
+
+	// start agreeing
+	go px.proposerStart(seq, v)
+
 }
 
 //
@@ -113,6 +132,13 @@ func (px *Paxos) Start(seq int, v interface{}) {
 //
 func (px *Paxos) Done(seq int) {
 	// Your code here.
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	if seq > px.done[px.peers[px.me]] {
+		px.done[px.peers[px.me]] = seq
+	}
 }
 
 //
@@ -121,8 +147,24 @@ func (px *Paxos) Done(seq int) {
 // this peer.
 //
 func (px *Paxos) Max() int {
-	// Your code here.
-	return 0
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	// map ver
+	max := -1
+	for seq, _ := range px.log {
+		if seq > max {
+			max = seq
+		}
+	}
+	return max
+
+	// log ver
+	//	if px.logs.Len() == 0 {
+	//		return -1
+	//	} else {
+	//		return px.logs.Back().Value.(*entry).seq
+	//	}
 }
 
 //
@@ -154,24 +196,415 @@ func (px *Paxos) Max() int {
 // instances.
 //
 func (px *Paxos) Min() int {
-	// You code here.
-	return 0
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	return px.minDone() + 1
+
 }
 
 //
 // the application wants to know whether this
 // peer thinks an instance has been decided,
 // and if so what the agreed value is. Status()
-// should just inspect the local peer state;
+// should just inspect the local peer log;
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
-	// Your code here.
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	if seq <= px.minDone() {
+		return Forgotten, nil
+	}
+	_, exist := px.log[seq]
+	if exist && px.log[seq].decided {
+		return Decided, px.log[seq].decidedProposal.Value
+	}
 	return Pending, nil
+
 }
 
+// Added function
 
+func (px *Paxos) proposerStart(seq int, v interface{}) {
+	// init
+	var majorityPrepared bool
+	var n_a = -1
+	var n_v = Proposal{Number: -1}
 
+	// add is dead check so that loop doesn't last indefinitely hogging cpu
+	for px.stillDeciding(seq) && !px.isdead() {
+
+		proposalNumber := px.nextProposalNumber(seq, n_a)
+
+		var proposal = Proposal{Number: proposalNumber, Value: v}
+
+		majorityPrepared, n_a, n_v = px.peerPrepare(seq, proposal)
+
+		if !majorityPrepared {
+			time.Sleep(time.Duration(rand.Intn(100)))
+			continue
+		}
+
+		if !px.stillDeciding(seq) {
+			break
+		}
+
+		if n_v.Number == -1 {
+			// initial
+			// can use the proposed value
+		} else {
+			// use the highest accepted value in majority
+			proposal.Value = n_v.Value
+		}
+
+		majorityAccepted := px.peerAccept(seq, proposal)
+
+		if !majorityAccepted {
+			time.Sleep(time.Duration(rand.Intn(100)))
+			continue
+
+		}
+
+		px.peerDecide(seq, proposal)
+		break
+	}
+}
+
+// RPCs
+func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+	seq := args.Seq
+	proposalNumber := args.ProposalNumber
+
+	// map ver
+	_, present := px.log[seq]
+	if present {
+		// continue accepting prepare requests
+	} else {
+		px.log[seq] = px.makeEntry()
+	}
+
+	// log ver
+	// px.insertEntryIfNotExist(args.Seq)
+
+	if proposalNumber > px.log[seq].n_p {
+		// Promise not to accept proposals numbered less than n
+		px.log[seq].n_p = proposalNumber
+		reply.OK = true
+		reply.Promise = proposalNumber
+		reply.LastAcceptedProposal.Number = px.log[seq].acceptedProposal.Number
+		reply.LastAcceptedProposal.Value = px.log[seq].acceptedProposal.Value
+		return nil
+	}
+	reply.OK = false
+	reply.Promise = px.log[seq].n_p
+	reply.LastAcceptedProposal = px.log[seq].acceptedProposal
+	return nil
+}
+
+func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	var seq = args.Seq
+	var proposal = args.Proposal
+
+	// map ver
+	_, present := px.log[seq]
+	if !present {
+		px.log[seq] = px.makeEntry()
+	}
+
+	if proposal.Number >= px.log[seq].n_p {
+		px.log[seq].n_p = proposal.Number
+		px.log[seq].acceptedProposal = proposal
+		reply.OK = true
+		reply.MaxDone = px.done[px.peers[px.me]]
+		return nil
+	}
+	reply.OK = false
+	reply.MaxDone = px.done[px.peers[px.me]]
+
+	return nil
+
+	// log ver
+	// px.insertEntryIfNotExist(seq)
+	// ent := px.getEntry(seq)
+
+}
+
+func (px *Paxos) Decide(args *DecidedArgs, reply *DecidedReply) error {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	var seq = args.Seq
+	var proposal = args.Proposal
+
+	// map ver
+	_, present := px.log[seq]
+	if !present {
+		px.log[seq] = px.makeEntry()
+	}
+
+	// log ver
+	// px.insertEntryIfNotExist(seq)
+
+	px.log[seq].decisionReached(proposal)
+
+	return nil
+}
+
+func (px *Paxos) peerPrepare(seq int, proposal Proposal) (bool, int, Proposal) {
+	// do evaluation
+	count := 0
+	highNumber := -1
+	highProposal := Proposal{Number: -1}
+
+	for _, peer := range px.peers {
+		args := &PrepareArgs{}
+		args.Seq = seq
+		args.ProposalNumber = proposal.Number
+
+		var reply PrepareReply
+
+		ok := false
+		if peer == px.peers[px.me] {
+			err := px.Prepare(args, &reply)
+			if err == nil {
+				ok = true
+			}
+		} else {
+			ok = call(peer, "Paxos.Prepare", args, &reply)
+		}
+
+		if ok {
+			count++
+			if reply.Promise > highNumber {
+				highNumber = reply.Promise
+			}
+			if reply.LastAcceptedProposal.Number > highProposal.Number {
+				highProposal = reply.LastAcceptedProposal
+			}
+		}
+	}
+
+	return px.isMajority(count), highNumber, highProposal
+
+}
+
+func (px *Paxos) peerAccept(seq int, proposal Proposal) bool {
+
+	// piggyback & cleaning forgotten data is also done here
+
+	count := 0
+	for _, peer := range px.peers {
+		args := &AcceptArgs{}
+		args.Seq = seq
+		args.Proposal = proposal
+		var reply AcceptReply
+
+		if peer == px.peers[px.me] {
+			px.Accept(args, &reply)
+		} else {
+			call(peer, "Paxos.Accept", args, &reply)
+		}
+
+		if reply.OK {
+			count++
+		}
+		px.updatePeerDone(peer, reply.MaxDone) // for cleaning purpose
+	}
+
+	return px.isMajority(count)
+}
+
+func (px *Paxos) peerDecide(seq int, proposal Proposal) {
+	for _, peer := range px.peers {
+		args := &DecidedArgs{}
+		args.Seq = seq
+		args.Proposal = proposal
+		var reply DecidedReply
+		if peer == px.peers[px.me] {
+			px.Decide(args, &reply)
+		} else {
+			call(peer, "Paxos.Decide", args, &reply)
+		}
+	}
+	return
+}
+
+// end of RPCs
+
+// helper
+func (px *Paxos) insertEntryIfNotExist(seq int) {
+	// log ver
+	//	ent := px.makeEntry()
+
+	//	ent.seq = seq
+
+	//	if px.logs.Len() == 0 {
+	//		px.logs.PushBack(ent)
+	//	} else if px.logs.Front().Value.(*entry).seq > seq {
+	//		px.logs.PushFront(ent)
+	//	} else {
+	//		e := px.logs.Back()
+	//		for ; e != nil; e = e.Prev() {
+	//			if e.Value.(*entry).seq < seq {
+	//				px.logs.InsertAfter(ent, e)
+	//				break
+	//			}
+	//		}
+	//	}
+
+	// map ver
+	_, ok := px.log[seq]
+	if !ok {
+		px.log[seq] = px.makeEntry()
+	}
+
+}
+
+func (px *Paxos) getEntry(seq int) *entry {
+	// list ver
+	//	if px.logs.Len() == 0 {
+	//		return nil
+	//	}
+	//	for e := px.logs.Back(); e != nil; e = e.Prev() {
+	//		if e.Value.(*entry).seq == seq {
+	//			return e.Value.(*entry)
+	//		}
+	//	}
+	//	return nil
+
+	// map ver
+	v, ok := px.log[seq]
+	if ok {
+		return v
+	} else {
+		return nil
+	}
+}
+
+func (px *Paxos) makeEntry() *entry {
+	initialProposalNumber := px.me - len(px.peers)
+	ent := &entry{n_p: -1,
+		decided:          false,
+		proposalNumber:   initialProposalNumber,
+		acceptedProposal: Proposal{Number: -1},
+		seq:              -1,
+	}
+	return ent
+}
+
+func (px *Paxos) existEntry(seq int) bool {
+	return px.getEntry(seq) != nil
+}
+
+// end of helper
+
+func (px *Paxos) isMajority(okCount int) bool {
+	if okCount <= (len(px.peers) / 2) {
+		return false
+	}
+	return true
+}
+
+func (px *Paxos) nextProposalNumber(seq int, n_p int) int {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	// always use a offset of server count to avoid repetition
+	currentNumber := px.log[seq].proposalNumber
+	nextProposalNumber := currentNumber + len(px.peers)
+	for nextProposalNumber <= n_p {
+		nextProposalNumber += len(px.peers)
+	}
+	px.log[seq].proposalNumber = nextProposalNumber
+
+	return nextProposalNumber
+}
+
+func (px *Paxos) stillDeciding(seq int) bool {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	// map ver
+	if seq <= px.minDone() {
+		return false
+	}
+	_, present := px.log[seq]
+	if present {
+		if px.log[seq].decided {
+			return false
+		} else {
+			return true
+		}
+	}
+	return false
+
+	// log ver
+	//	if seq <= px.minDone() {
+	//		return false
+	//	}
+	//	ent := px.getEntry(seq)
+	//	if ent != nil && ent.decided {
+	//		return false
+	//	}
+	//	return true
+}
+
+func (px *Paxos) updatePeerDone(peer string, maxDone int) {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	if maxDone > px.done[peer] {
+		px.done[peer] = maxDone
+		px.clean()
+	}
+}
+
+func (px *Paxos) minDone() int {
+	var minDone = px.done[px.peers[px.me]]
+	for _, peerDone := range px.done {
+		if peerDone < minDone {
+			minDone = peerDone
+		}
+	}
+	return minDone
+}
+
+func (px *Paxos) clean() {
+
+	var minDone = px.minDone()
+
+	// map ver
+	for seq, _ := range px.log {
+		if seq < minDone {
+			delete(px.log, seq)
+		}
+	}
+
+	// log ver
+	//	if px.logs.Len() == 0 {
+	//		return
+	//	}
+	//	e := px.logs.Front()
+	//	for e != nil {
+	//		if e.Value.(*entry).seq <= seq {
+	//			temp := e
+	//			e = e.Next()
+	//			px.logs.Remove(temp)
+	//		} else {
+	//			break
+	//		}
+	//	}
+
+}
+
+// end of added function
 //
 // tell the peer to shut itself down.
 // for testing.
@@ -214,8 +647,17 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.peers = peers
 	px.me = me
 
-
 	// Your initialization code here.
+
+	// intialize log
+	// px.logs := list.New()
+
+	// haven't called done before
+	px.log = map[int]*entry{}
+	px.done = map[string]int{}
+	for _, peer := range px.peers {
+		px.done[peer] = -1
+	}
 
 	if rpcs != nil {
 		// caller will create socket &c
@@ -267,7 +709,6 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 			}
 		}()
 	}
-
 
 	return px
 }
