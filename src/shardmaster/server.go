@@ -22,35 +22,58 @@ type ShardMaster struct {
 	px         *paxos.Paxos
 
 	configs []Config // indexed by config num
+	lastSeq int
 }
 
+const (
+	Join = "Join"
+	Leave = "Leave"
+	Move = "Move"
+	Query = "Query"
+	NoOp = "NoOp"
+)
+
+type Args interface{}
 
 type Op struct {
 	// Your data here.
+	Type string // Join, Leave, Move, Query
+	Args Args
+	Uid int64
 }
 
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) error {
 	// Your code here.
-
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.joinHandler(args)
 	return nil
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) error {
 	// Your code here.
-
+	// group leaves, share its shards to other groups
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.leaveHandler(args)
 	return nil
 }
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) error {
 	// Your code here.
-
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.moveHandler(args)
 	return nil
 }
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) error {
 	// Your code here.
-
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.queryHandler(args)
+	reply.Config = sm.groupQuery(args.Num)
 	return nil
 }
 
@@ -92,9 +115,16 @@ func StartServer(servers []string, me int) *ShardMaster {
 	sm.configs = make([]Config, 1)
 	sm.configs[0].Groups = map[int64][]string{}
 
+	sm.lastSeq = -1
+
 	rpcs := rpc.NewServer()
 
 	gob.Register(Op{})
+	gob.Register(JoinArgs{})
+	gob.Register(LeaveArgs{})
+	gob.Register(MoveArgs{})
+	gob.Register(QueryArgs{})
+
 	rpcs.Register(sm)
 	sm.px = paxos.Make(servers, me, rpcs)
 

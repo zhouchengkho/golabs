@@ -27,6 +27,9 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 type Op struct {
 	// Your definitions here.
+	Id int64
+	Name string
+	Args Args
 }
 
 
@@ -42,28 +45,90 @@ type ShardKV struct {
 	gid int64 // my replica group ID
 
 	// Your definitions here.
+	currentConfig shardmaster.Config
+	lastConfig shardmaster.Config
+	shards []bool                    // whether or not ith shard is present
+	nextTransitionNumber int                // Num of new Config transitioning to, -1 if not transitioning
+	// Key/Value State
+	lastSeq int
+	data map[string]string        
+	cache map[string]Reply
+	
 }
 
-
+// RPC handler for client get requests
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := kv.getHandler(args)
+
+	reply.Value = r.Value
+	reply.Err = r.Err
 	return nil
 }
 
 // RPC handler for client Put and Append requests
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := kv.putAppendHandler(args)
+	reply.Err = r.Err
 	return nil
 }
 
-//
-// Ask the shardmaster if there's a new configuration;
-// if so, re-configure.
-//
-func (kv *ShardKV) tick() {
+// RPC handler for receiving shard
+func (kv *ShardKV) ReceiveShard(args *ReceiveShardArgs, reply *ReceiveShardReply) error {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := kv.receiveShardHandler(args)
+	reply.Err = r.Err
+	return nil
 }
 
-// tell the server to shut itself down.
+func (kv *ShardKV) tick() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.proposeNoOp() // to catchup
+
+	if kv.nextTransitionNumber == -1 {
+		if kv.currentConfig.Num == 0 {
+			config := kv.sm.Query(1)
+			if config.Num == 1 {
+				kv.lastConfig = kv.currentConfig
+				kv.currentConfig = config
+				kv.shards = getShardState(kv.currentConfig.Shards, kv.gid)
+				return
+			}
+			return
+		}
+
+		config := kv.sm.Query(-1)
+		if config.Num > kv.currentConfig.Num {
+			operation := genOp(StartNewConfig, ReConfigStartArgs{})
+			seq := kv.agree(operation)
+
+			kv.catchup(seq)
+			kv.doOp(seq, operation)
+		} else {
+		}
+	} else {
+		kv.sendShardStateToPeer()
+
+		if kv.sendOk() && kv.receiveOk() {
+			operation := genOp(EndNewConfig, ReConfigEndArgs{})
+			seq := kv.agree(operation)
+
+			kv.catchup(seq)
+			kv.doOp(seq, operation)
+		}
+	}
+}
+
+// tell the server to shut itsm down.
 // please don't change these two functions.
 func (kv *ShardKV) kill() {
 	atomic.StoreInt32(&kv.dead, 1)
@@ -101,7 +166,14 @@ func (kv *ShardKV) isunreliable() bool {
 func StartServer(gid int64, shardmasters []string,
 	servers []string, me int) *ShardKV {
 	gob.Register(Op{})
-
+	gob.Register(GetArgs{})
+	gob.Register(PutAppendArgs{})
+	gob.Register(ReConfigStartArgs{})
+	gob.Register(ReConfigEndArgs{})
+	gob.Register(ReceiveShardArgs{})
+	gob.Register(SentShardArgs{})
+	gob.Register(NoOpArgs{})
+	gob.Register(KVPair{})
 	kv := new(ShardKV)
 	kv.me = me
 	kv.gid = gid
@@ -109,6 +181,17 @@ func StartServer(gid int64, shardmasters []string,
 
 	// Your initialization code here.
 	// Don't call Join().
+	kv.lastConfig = shardmaster.Config{}
+	kv.lastConfig.Groups = map[int64][]string{}
+	kv.currentConfig = shardmaster.Config{}
+	kv.currentConfig.Groups = map[int64][]string{}
+	kv.shards = make([]bool, shardmaster.NShards)
+	kv.nextTransitionNumber = -1
+	kv.data = map[string]string{}
+	kv.cache =  map[string]Reply{}
+	kv.lastSeq = -1
+
+
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
